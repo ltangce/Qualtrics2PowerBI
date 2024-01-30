@@ -3,7 +3,7 @@
 // LT 20240129 Fixed persistent need longer delay. Seemed necessary to assign user agent.
 // LT 20240117 Fixed recursive bug. Opt for waiting a fix amount of seconds.
 // LT 20240116 First version
-
+// If the code return error not finding fieldId, make the delay longer.
 
 //This PowerBI M-Query starts a Qualtrics survey export, waits for it to complete, downloads the file (.zip) and unzips it to csv.
 //Please refer to relevent script in QualtricsAPI as this script mirrors the processes in Python.
