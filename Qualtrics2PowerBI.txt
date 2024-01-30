@@ -14,7 +14,7 @@ let
     // Parameters
     apiToken = #"X-API",
     surveyId = #"survey_id",
-    delay = 1, //Checks this delay twice
+    delay = 1, //Checks with the delay twice. Make this longer based on specific data.
     baseUrl = "https://consumersenergy.iad1.qualtrics.com",
 
     // Construct the base URL using the survey ID parameter
