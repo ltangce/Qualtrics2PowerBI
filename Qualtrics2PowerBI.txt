@@ -1,0 +1,199 @@
+//Lingfei Tang 20240117
+// Version history
+// LT 20240129 Fixed persistent need longer delay. Seemed necessary to assign user agent.
+// LT 20240117 Fixed recursive bug. Opt for waiting a fix amount of seconds.
+// LT 20240116 First version
+
+
+//This PowerBI M-Query starts a Qualtrics survey export, waits for it to complete, downloads the file (.zip) and unzips it to csv.
+//Please refer to relevent script in QualtricsAPI as this script mirrors the processes in Python.
+//https://github.com/Jaseibert/QualtricsAPI/blob/master/QualtricsAPI/Survey/responses.py
+//The M-Query unzip code is from https://github.com/Michael19842/PowerBiFunctions/blob/main/ZipFile/Unzip.m
+
+let
+    // Parameters
+    apiToken = #"X-API",
+    surveyId = #"survey_id",
+    delay = 1, //Checks this delay twice
+    baseUrl = "https://consumersenergy.iad1.qualtrics.com",
+
+    // Construct the base URL using the survey ID parameter
+    surveyUrl = baseUrl & "/API/v3/surveys/" & surveyId & "/export-responses/",
+    headers = [#"Content-Type"="application/json", #"X-API-TOKEN"=apiToken, #"User-Agent"="PostmanRuntime/7.36.1"],
+    body = "{
+        ""format"": ""csv"" 
+        }",
+
+    // Function to start the export and get progress_id
+    StartExport = () as text =>
+    let
+        start_response = Json.Document(Web.Contents(surveyUrl, [Headers=headers, Content=Text.ToBinary(body)])),
+        progress_id = start_response[result][progressId]
+    in
+        progress_id,
+
+    // Function to check the progress
+    CheckProgress = (progress_id as text, delay as number) =>
+    let
+        check_url = surveyUrl & progress_id,
+        CheckResponse = () => Json.Document(Web.Contents(check_url, [Headers=headers])),
+        check_response = Function.InvokeAfter(CheckResponse, #duration(0,0,0,delay)),
+        output = if check_response[result][status] = "complete" then check_response[result][fileId]
+            else Function.InvokeAfter(CheckResponse, #duration(0,0,0,delay))[result][fileId]
+
+    in
+        output,
+
+    // Unzip the file
+    UnzipFile = (ZipFile as binary) =>
+    let
+        //Load the file into a buffer
+        ZipFileBuffer = Binary.Buffer(ZipFile),
+        ZipFileSize = Binary.Length(ZipFileBuffer),
+        //Constant values used in the query
+        CentralHeaderSignature = 0x02014b50,
+        CentralHeaderSize = 42,
+        LocalHeaderSize = 30,
+        // Predefined byteformats that are used many times over 
+        Unsigned16BitLittleIEndian =
+            BinaryFormat.ByteOrder(
+                BinaryFormat.UnsignedInteger16,
+                ByteOrder.LittleEndian
+            ),
+        Unsigned32BitLittleIEndian =
+            BinaryFormat.ByteOrder(
+                BinaryFormat.UnsignedInteger32,
+                ByteOrder.LittleEndian
+            ),
+        // Definition of central directory header
+        CentralDirectoryHeader =
+            BinaryFormat.Record(
+                [
+                    Version = Unsigned16BitLittleIEndian,
+                    VersionNeeded = Unsigned16BitLittleIEndian,
+                    GeneralPurposeFlag = Unsigned16BitLittleIEndian,
+                    CompressionMethod = Unsigned16BitLittleIEndian,
+                    LastModifiedTime = Unsigned16BitLittleIEndian,
+                    LastModifiedDate = Unsigned16BitLittleIEndian,
+                    CRC32 = Unsigned32BitLittleIEndian,
+                    CompressedSize = Unsigned32BitLittleIEndian,
+                    UncompressedSize = Unsigned32BitLittleIEndian,
+                    FileNameLength = Unsigned16BitLittleIEndian,
+                    ExtrasLength = Unsigned16BitLittleIEndian,
+                    FileCommentLenght = Unsigned16BitLittleIEndian,
+                    DiskNumberStarts = Unsigned16BitLittleIEndian,
+                    InternalFileAttributes = Unsigned16BitLittleIEndian,
+                    EnternalFileAttributes = Unsigned32BitLittleIEndian,
+                    LocalHeaderOffset = Unsigned32BitLittleIEndian
+                ]
+            ),
+        // Definition of the end of central directory record
+        EndOfCentralDirectoryRecord =
+            BinaryFormat.Record(
+                [
+                    RestOfFile = BinaryFormat.Binary(ZipFileSize - 22),
+                    EOCDsignature = Unsigned32BitLittleIEndian,
+                    NumberOfThisDisk = Unsigned16BitLittleIEndian,
+                    DiskWhereCentralDirectoryStarts = Unsigned16BitLittleIEndian,
+                    NumberOfRecordsOnThisDisk = Unsigned16BitLittleIEndian,
+                    TotalNumberOfRecords = Unsigned16BitLittleIEndian,
+                    CentralDirectorySize = Unsigned32BitLittleIEndian,
+                    OffsetToStart = Unsigned32BitLittleIEndian
+                ]
+            ),
+        //Formatter used for building a table of all files in te central directory
+        CentralHeaderFormatter =
+            BinaryFormat.Choice(
+                Unsigned32BitLittleIEndian,
+                // Should contain the signature
+                each
+                    if _ <> CentralHeaderSignature // Test if the signature is not there
+                    then
+                        BinaryFormat.Record(
+                            [
+                                LocalHeaderOffset = null,
+                                CompressedSize = null,
+                                FileNameLength = null,
+                                HeaderSize = null,
+                                IsValid = false,
+                                Filename = null
+                            ]
+                        )
+                    // if so create a dummy entry 
+                    else
+                        BinaryFormat.Choice(
+                            //Catch the staticly sized part of the central header
+                            BinaryFormat.Binary(CentralHeaderSize),
+                            //Create a record containing the files size, offset(of the local header), name, etc.. 
+                            each
+                                BinaryFormat.Record(
+                                    [
+                                        LocalHeaderOffset = CentralDirectoryHeader(_)[LocalHeaderOffset],
+                                        CompressedSize = CentralDirectoryHeader(_)[CompressedSize],
+                                        FileNameLength = CentralDirectoryHeader(_)[FileNameLength],
+                                        HeaderSize =
+                                            LocalHeaderSize
+                                            + CentralDirectoryHeader(_)[FileNameLength]
+                                            + CentralDirectoryHeader(_)[ExtrasLength],
+                                        IsValid = true,
+                                        Filename = BinaryFormat.Text(CentralDirectoryHeader(_)[FileNameLength])
+                                    ]
+                                ),
+                            type binary
+                        )
+            ),
+        //Get a record of the end of central directory, this contains the offset of the central header so we can itterate from that position
+        EOCDR = EndOfCentralDirectoryRecord(ZipFileBuffer),
+        //Get the central directory as a binary extract
+        CentralDirectory =
+            Binary.Range(
+                ZipFileBuffer,
+                EOCDR[OffsetToStart]
+            ),
+        //A list formatter for the central directory  
+        CentralDirectoryFormatter =
+            BinaryFormat.List(
+                CentralHeaderFormatter,
+                each _[IsValid] = true
+            ),
+        //Get a Table from Records containing the file info extracted from the central directory
+        FilesTable =
+            Table.FromRecords(
+                List.RemoveLastN(
+                    CentralDirectoryFormatter(CentralDirectory),
+                    1
+                )
+            ),
+        //Add the binary to the table and decompress it
+        ReturnValue =
+            Table.AddColumn(
+                FilesTable,
+                "Content",
+                each
+                    Binary.Decompress(
+                        Binary.Range(
+                            ZipFileBuffer,
+                            [LocalHeaderOffset] + [HeaderSize],
+                            [CompressedSize]
+                        ),
+                        Compression.Deflate
+                    )
+            )
+    in
+        ReturnValue,
+
+    // Start the export and get the progress_id
+    progress_id = StartExport(),
+
+    // Call the function to check the progress
+    fileId = CheckProgress(progress_id, delay),
+
+    // Download the file if export is complete
+    download_url = surveyUrl & fileId & "/file",
+    download_request = Web.Contents(download_url, [Headers=headers]),
+
+    // Output the binary content
+    Output = Binary.Buffer(download_request),
+    UnzippedContent = UnzipFile(Output)
+in
+    UnzippedContent
